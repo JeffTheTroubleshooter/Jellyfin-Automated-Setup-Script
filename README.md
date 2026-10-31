@@ -8,6 +8,19 @@
 - Clones jellyfin-packaging and builds a portable Linux archive.
 - Installs Jellyfin (default `/opt/jellyfin`) and creates a `jellyfin` systemd service.
 
+## Supported distros
+
+| Distro family | Status |
+|---|---|
+| Debian, Ubuntu, Linux Mint, Pop!_OS, Zorin, elementary OS | Expected to work |
+| Fedora | Expected to work |
+| Arch, Manjaro, EndeavourOS, Garuda | Not tested, need feedback |
+| openSUSE, SLES | Not tested, need feedback |
+| RHEL, Rocky, AlmaLinux, CentOS, Oracle Linux | Not tested, need feedback (Docker may need its own repo) |
+| Alpine | Not tested, need feedback (no systemd service; start Jellyfin manually) |
+
+If you try it on a distro marked "Not tested", please open an issue saying whether it worked.
+
 ## Install
 
 ```bash
