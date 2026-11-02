@@ -43,3 +43,7 @@ bash jellyfin-install.sh uninstall
 ```
 
 This removes the service, the install files and the build folder, and asks before removing packages.
+
+## Part of the Proxmox Homelab setup
+
+This installer is used by [Proxmox-Homelab-Automated-Setup-Script](https://github.com/JeffTheTroubleshooter/Proxmox-Homelab-Automated-Setup-Script), which creates an LXC for each app on a Proxmox host and runs this script inside it.
