@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 #
 # Jellyfin installer / uninstaller (from source via jellyfin-packaging)
-# Detects distro, installs build deps (including Docker), clones packaging repo,
-# builds a portable Linux archive, installs it, and creates a systemd service.
+# Detects distro, installs build deps (.NET SDK + Node.js), clones packaging repo,
+# builds a portable Linux archive natively (no Docker), installs it, and creates a systemd service.
 #
 # Usage:
 #   bash jellyfin-install.sh            # install
@@ -69,33 +69,13 @@ install_packages() {
     apt)
       sudo apt-get update -qq
       sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
-        git python3 python3-git python3-yaml python3-packaging docker.io curl ca-certificates
+        git python3 python3-git python3-yaml python3-packaging curl ca-certificates tar gzip
       ;;
-    dnf)
-      if ! command -v docker >/dev/null 2>&1; then
-        sudo dnf install -y git python3 python3-GitPython python3-pyyaml python3-packaging docker curl ca-certificates || \
-        sudo dnf install -y git python3 python3-GitPython python3-pyyaml python3-packaging moby-engine curl ca-certificates
-      else
-        sudo dnf install -y git python3 python3-GitPython python3-pyyaml python3-packaging curl ca-certificates
-      fi
-      ;;
-    pacman)
-      sudo pacman -Sy --noconfirm git python python-gitpython python-pyyaml python-packaging docker curl ca-certificates
-      ;;
-    zypper)
-      sudo zypper --non-interactive install git python3 python3-GitPython python3-PyYAML python3-packaging docker curl ca-certificates
-      ;;
-    apk)
-      sudo apk add --no-cache git python3 py3-gitpython py3-yaml py3-packaging docker curl ca-certificates
-      ;;
+    dnf)    sudo dnf install -y git python3 python3-GitPython python3-pyyaml python3-packaging curl ca-certificates tar gzip ;;
+    pacman) sudo pacman -Sy --noconfirm git python python-gitpython python-pyyaml python-packaging curl ca-certificates tar gzip ;;
+    zypper) sudo zypper --non-interactive install git python3 python3-GitPython python3-PyYAML python3-packaging curl ca-certificates tar gzip ;;
+    apk)    sudo apk add --no-cache git python3 py3-gitpython py3-yaml py3-packaging curl ca-certificates tar gzip ;;
   esac
-
-  if command -v systemctl >/dev/null 2>&1; then
-    sudo systemctl enable --now docker 2>/dev/null || true
-  elif command -v rc-service >/dev/null 2>&1; then
-    sudo rc-update add docker default 2>/dev/null || true
-    sudo rc-service docker start 2>/dev/null || true
-  fi
 
   ok "Dependencies ready."
 }
@@ -141,35 +121,105 @@ ensure_python_modules() {
 }
 
 # ── build ──────────────────────────────────────────────────────────────────
-# Returns archive path via global ARCHIVE (avoids pipefail + command-sub issues)
+# Native from-source build (no Docker). jellyfin-packaging's build.py runs
+# `docker buildx build` via os.system() and ignores its exit code; Debian's
+# docker.io has no buildx plugin and CT 201 is an unprivileged LXC without
+# keyctl, so the image is never built and the failure only shows up later as
+# "pull access denied". Instead we do exactly what portable/build.sh does in
+# that image (dotnet publish + npm run build:production), directly on the host,
+# with the same .NET / Node versions build.yaml pins for the submodule HEADs.
+BUILD_LOG="/var/log/jellyfin-build.log"
+
+# Print "KEY=VALUE" for DOTNET_VERSION / NODEJS_VERSION, mirroring build.py's
+# _determine_framework_versions (newest pinned commit that is an ancestor of HEAD).
+framework_versions() {
+  python3 - <<'PY'
+import subprocess, yaml
+from packaging.version import Version
+cfg = yaml.safe_load(open("build.yaml"))["frameworks"]
+for sub, args in cfg.items():
+    for key, pins in args.items():
+        val = None
+        for commit, v in sorted(pins.items(), key=lambda kv: Version(str(kv[1]))):
+            if subprocess.run(["git", "-C", sub, "merge-base", "--is-ancestor", commit, "HEAD"],
+                              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0:
+                val = v
+        if val is not None:
+            print(f"{key}={val}")
+PY
+}
+
+install_toolchain() {
+  local dotnet_ver="$1" node_ver="$2"
+  [[ "$PKG" == "apt" ]] || die "Native Jellyfin build supports Debian/Ubuntu only (detected $ID). Install dotnet-sdk-$dotnet_ver and Node.js $node_ver manually, then rerun."
+  # shellcheck disable=SC1091
+  . /etc/os-release
+  local msid="$ID" msver="$VERSION_ID"
+  [[ "$msid" == "debian" ]] && msver="${VERSION_ID%%.*}"
+  if ! dotnet --list-sdks 2>/dev/null | grep -q "^${dotnet_ver}\."; then
+    info "Installing .NET SDK $dotnet_ver (packages.microsoft.com)..."
+    curl -fsSL "https://packages.microsoft.com/config/${msid}/${msver}/packages-microsoft-prod.deb" -o /tmp/packages-microsoft-prod.deb \
+      || die "Could not download Microsoft repo config for ${msid} ${msver}."
+    sudo dpkg -i /tmp/packages-microsoft-prod.deb
+    sudo apt-get update -qq
+    sudo DEBIAN_FRONTEND=noninteractive apt-get install -y "dotnet-sdk-${dotnet_ver}" \
+      || die "apt could not install dotnet-sdk-${dotnet_ver}."
+  fi
+  if [[ "$(node -v 2>/dev/null | sed 's/^v//; s/\..*//')" != "$node_ver" ]]; then
+    info "Installing Node.js $node_ver (NodeSource)..."
+    curl -fsSL "https://deb.nodesource.com/setup_${node_ver}.x" -o /tmp/nodesource-setup.sh \
+      || die "Could not download NodeSource setup for Node.js $node_ver."
+    sudo bash /tmp/nodesource-setup.sh
+    sudo DEBIAN_FRONTEND=noninteractive apt-get install -y nodejs || die "apt could not install nodejs $node_ver."
+  fi
+  ok "Toolchain: .NET $(dotnet --version), Node $(node -v), npm $(npm -v)"
+}
+
+# Returns archive path via global ARCHIVE
 build_jellyfin() {
   info "Cloning jellyfin-packaging..."
   rm -rf "$BUILD_DIR"
   git clone --depth 1 "$REPO_URL" "$BUILD_DIR"
   cd "$BUILD_DIR"
 
-  info "Initializing submodules..."
-  git submodule update --init
+  info "Initializing submodules (jellyfin-server, jellyfin-web)..."
+  git submodule update --init jellyfin-server jellyfin-web
 
   ensure_python_modules
-  info "Building portable Linux archive (this can take several minutes)..."
-  if docker info >/dev/null 2>&1; then
-    ./build.py auto linux amd64 || true
-  else
-    sudo ./build.py auto linux amd64 || true
-  fi
+  local DOTNET_VERSION=8.0 NODEJS_VERSION=20 kv
+  while IFS= read -r kv; do
+    case "$kv" in
+      DOTNET_VERSION=*) DOTNET_VERSION="${kv#*=}" ;;
+      NODEJS_VERSION=*) NODEJS_VERSION="${kv#*=}" ;;
+    esac
+  done < <(framework_versions)
+  info "Framework versions from build.yaml: .NET $DOTNET_VERSION, Node $NODEJS_VERSION"
+  install_toolchain "$DOTNET_VERSION" "$NODEJS_VERSION"
 
-  # Safe archive lookup (no pipefail issues)
-  ARCHIVE=""
-  local f
-  for f in out/linux/jellyfin_*-amd64.tar.xz out/linux/jellyfin_*-amd64.tar.gz; do
-    if [[ -f "$f" ]]; then
-      ARCHIVE="$(cd "$(dirname "$f")" && pwd)/$(basename "$f")"
-      break
-    fi
-  done
+  local stage="$BUILD_DIR/stage/jellyfin" version
+  version="$(date +%Y%m%d%H)"
+  rm -rf "$BUILD_DIR/stage" && mkdir -p "$stage" "$BUILD_DIR/out/linux"
+  sudo touch "$BUILD_LOG" && sudo chown "$USER" "$BUILD_LOG" && : > "$BUILD_LOG"
+  info "Building Jellyfin from source (several minutes; full log: $BUILD_LOG)..."
+  export DOTNET_CLI_TELEMETRY_OPTOUT=1 DOTNET_NOLOGO=1
+  export NODE_OPTIONS="--max-old-space-size=2048"
 
-  [[ -n "$ARCHIVE" ]] || die "Build finished but no archive found in out/linux/"
+  info "[1/3] dotnet publish jellyfin-server..."
+  (cd jellyfin-server && dotnet publish Jellyfin.Server --configuration Release \
+      --self-contained --runtime linux-x64 --output "$stage" \
+      -p:DebugSymbols=false -p:DebugType=none -p:UseAppHost=true) >>"$BUILD_LOG" 2>&1 \
+    || { tail -n 40 "$BUILD_LOG" >&2; die "dotnet publish (jellyfin-server) failed. See $BUILD_LOG"; }
+
+  info "[2/3] npm ci + build jellyfin-web..."
+  (cd jellyfin-web && npm ci --no-audit --unsafe-perm && npm run build:production \
+      && rm -rf "$stage/jellyfin-web" && mv dist "$stage/jellyfin-web") >>"$BUILD_LOG" 2>&1 \
+    || { tail -n 40 "$BUILD_LOG" >&2; die "jellyfin-web build failed. See $BUILD_LOG"; }
+
+  info "[3/3] Packing archive..."
+  ARCHIVE="$BUILD_DIR/out/linux/jellyfin_${version}-amd64.tar.gz"
+  tar -C "$BUILD_DIR/stage" -czf "$ARCHIVE" jellyfin/ || die "Could not create $ARCHIVE"
+  [[ -x "$stage/jellyfin" && -f "$stage/jellyfin-web/index.html" ]] \
+    || die "Build produced an incomplete tree (missing jellyfin binary or web UI). See $BUILD_LOG"
   info "Build complete: $ARCHIVE"
 }
 
@@ -250,14 +300,14 @@ remove_build_dir() {
 }
 
 remove_packages() {
-  if ask_yn "Also remove build packages (git, python3, docker, etc.)? (may affect other software)"; then
+  if ask_yn "Also remove build packages (git, python3, dotnet, nodejs, etc.)? (may affect other software)"; then
     info "Removing packages..."
     case "$PKG" in
-      apt)    sudo apt-get remove -y git python3 python3-git python3-yaml python3-packaging docker.io || true ;;
-      dnf)    sudo dnf remove -y git python3 python3-GitPython python3-pyyaml python3-packaging docker || true ;;
-      pacman) sudo pacman -Rns --noconfirm git python python-gitpython python-pyyaml python-packaging docker || true ;;
-      zypper) sudo zypper --non-interactive remove git python3 python3-GitPython python3-PyYAML python3-packaging docker || true ;;
-      apk)    sudo apk del git python3 py3-gitpython py3-yaml py3-packaging docker || true ;;
+      apt)    sudo apt-get remove -y git python3 python3-git python3-yaml python3-packaging dotnet-sdk-* nodejs || true ;;
+      dnf)    sudo dnf remove -y git python3 python3-GitPython python3-pyyaml python3-packaging || true ;;
+      pacman) sudo pacman -Rns --noconfirm git python python-gitpython python-pyyaml python-packaging || true ;;
+      zypper) sudo zypper --non-interactive remove git python3 python3-GitPython python3-PyYAML python3-packaging || true ;;
+      apk)    sudo apk del git python3 py3-gitpython py3-yaml py3-packaging || true ;;
     esac
     ok "Package removal finished."
   else
