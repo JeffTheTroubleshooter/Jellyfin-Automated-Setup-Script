@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 #
 # Jellyfin installer / uninstaller (from source via jellyfin-packaging)
+# Memory guard: checks RAM/swap first, caps node/dotnet memory, and stops a
+# build step at once if it dies, is OOM-killed, or runs past STEP_TIMEOUT_SECS.
 # Detects distro, installs build deps (.NET SDK + Node.js), clones packaging repo,
 # builds a portable Linux archive natively (no Docker), installs it, and creates a systemd service.
 #
@@ -27,7 +29,8 @@ prompt() { local var="$1" msg="$2" default="$3"; read -rp "$msg [$default]: " in
 ask_yn() { local msg="$1" default="${2:-n}"; local ans; read -rp "$msg [y/N]: " ans; ans="${ans:-$default}"; [[ "$ans" =~ ^[Yy] ]]; }
 
 elapsed() {
-  local end=$(date +%s)
+  local end
+  end=$(date +%s)
   local secs=$((end - START_TIME))
   printf '%dm %ds' $((secs/60)) $((secs%60))
 }
@@ -35,6 +38,7 @@ elapsed() {
 # ── distro detection ───────────────────────────────────────────────────────
 detect_distro() {
   if [[ -f /etc/os-release ]]; then
+    # shellcheck disable=SC1091
     . /etc/os-release
     ID="${ID:-}"
     ID_LIKE="${ID_LIKE:-}"
@@ -197,6 +201,99 @@ install_toolchain() {
   ok "Toolchain: .NET $(dotnet --version), Node $(node -v), npm $(npm -v)"
 }
 
+# ── memory guard ───────────────────────────────────────────────────────────
+# The source build (dotnet publish + webpack) needs real memory. In a small
+# LXC/VM the kernel OOM-kills dotnet and the web build can then stall for
+# hours. Check RAM/swap up front, cap node/dotnet memory, and stop as soon as
+# a build step dies or anything in this machine's memory cgroup is OOM-killed.
+MIN_BUILD_MB="${MIN_BUILD_MB:-4096}"          # RAM + swap needed for the build
+STEP_TIMEOUT_SECS="${STEP_TIMEOUT_SECS:-5400}" # per build step; 0 = no limit
+MEM_MB=0 SWAP_MB=0
+
+# Usable memory: the smaller of /proc/meminfo (lxcfs shows the CT limit there)
+# and the cgroup v2/v1 limit, if one is set.
+detect_memory() {
+  local lim
+  MEM_MB=$(awk '/^MemTotal:/ {printf "%d", $2/1024}' /proc/meminfo)
+  SWAP_MB=$(awk '/^SwapTotal:/ {printf "%d", $2/1024}' /proc/meminfo)
+  lim=$(cat /sys/fs/cgroup/memory.max 2>/dev/null || cat /sys/fs/cgroup/memory/memory.limit_in_bytes 2>/dev/null || echo max)
+  if [[ "$lim" =~ ^[0-9]+$ ]] && (( lim / 1048576 < MEM_MB )); then
+    MEM_MB=$(( lim / 1048576 ))
+  fi
+}
+
+check_memory() {
+  detect_memory
+  local avail total=$(( MEM_MB + SWAP_MB ))
+  avail=$(awk '/^MemAvailable:/ {printf "%d", $2/1024}' /proc/meminfo)
+  info "Memory: ${MEM_MB} MB RAM (${avail} MB available), ${SWAP_MB} MB swap; build needs >= ${MIN_BUILD_MB} MB RAM+swap."
+  if (( total < MIN_BUILD_MB )); then
+    if [[ "${JELLYFIN_ALLOW_LOW_MEM:-0}" == "1" ]]; then
+      warn "Only ${total} MB RAM+swap; continuing because JELLYFIN_ALLOW_LOW_MEM=1."
+    else
+      die "Only ${total} MB RAM+swap (need ${MIN_BUILD_MB} MB to build Jellyfin from source).
+  Give this machine more memory or swap (Proxmox LXC: pct set <ctid> --memory 4096 --swap 2048),
+  or set JELLYFIN_ALLOW_LOW_MEM=1 / MIN_BUILD_MB=<n> to try anyway."
+    fi
+  fi
+  # node heap: ~half of RAM, between 1024 and 4096 MB
+  local heap=$(( MEM_MB / 2 ))
+  (( heap < 1024 )) && heap=1024
+  (( heap > 4096 )) && heap=4096
+  export NODE_OPTIONS="--max-old-space-size=${heap}"
+  # dotnet: workstation GC, conserve memory, no long-lived compiler server
+  export DOTNET_gcServer=0 DOTNET_GCConserveMemory=7 DOTNET_CLI_TELEMETRY_OPTOUT=1 DOTNET_NOLOGO=1
+  export MSBUILDDISABLENODEREUSE=1 DOTNET_CLI_USE_MSBUILD_SERVER=0
+  info "Limits: NODE_OPTIONS=$NODE_OPTIONS, dotnet single-node build (-m:1), workstation GC."
+}
+
+# OOM kills charged to this machine's memory cgroup so far.
+oom_kills() {
+  local n
+  n=$(awk '/^oom_kill / {print $2}' /sys/fs/cgroup/memory.events 2>/dev/null || true)
+  [[ -n "$n" ]] || n=$(awk '/^oom_kill / {print $2}' /sys/fs/cgroup/memory/memory.oom_control 2>/dev/null || true)
+  echo "${n:-0}"
+}
+
+# run_step <label> <cmd...>: run a build step in its own process group with
+# output in $BUILD_LOG. Fails fast (kills the whole step) on an OOM kill, on
+# timeout, or when the step exits non-zero; prints a progress line every 60s.
+run_step() {
+  local label="$1" pid rc=0 t0 now oom0 last=0
+  shift
+  oom0=$(oom_kills)
+  t0=$(date +%s)
+  setsid "$@" >>"$BUILD_LOG" 2>&1 &
+  pid=$!
+  while kill -0 "$pid" 2>/dev/null; do
+    sleep 5
+    now=$(date +%s)
+    if (( $(oom_kills) > oom0 )); then
+      kill -KILL -- "-$pid" 2>/dev/null || true; wait "$pid" 2>/dev/null || true
+      tail -n 20 "$BUILD_LOG" >&2
+      die "$label: the kernel OOM-killed a build process (out of memory). Give this machine more RAM/swap (need >= ${MIN_BUILD_MB} MB) and rerun. See $BUILD_LOG"
+    fi
+    if (( STEP_TIMEOUT_SECS > 0 && now - t0 >= STEP_TIMEOUT_SECS )); then
+      kill -TERM -- "-$pid" 2>/dev/null || true; sleep 3; kill -KILL -- "-$pid" 2>/dev/null || true
+      wait "$pid" 2>/dev/null || true
+      tail -n 20 "$BUILD_LOG" >&2
+      die "$label did not finish within $(( STEP_TIMEOUT_SECS / 60 ))m (STEP_TIMEOUT_SECS). See $BUILD_LOG"
+    fi
+    if (( now - last >= 60 )); then
+      last=$now
+      info "  ... $label: $(( (now - t0) / 60 ))m $(( (now - t0) % 60 ))s"
+    fi
+  done
+  wait "$pid" || rc=$?
+  if (( rc != 0 )); then
+    tail -n 40 "$BUILD_LOG" >&2
+    if (( rc == 137 )) || (( $(oom_kills) > oom0 )); then
+      die "$label was killed (exit $rc, likely out of memory). Give this machine more RAM/swap and rerun. See $BUILD_LOG"
+    fi
+    die "$label failed (exit $rc). See $BUILD_LOG"
+  fi
+}
+
 # Returns archive path via global ARCHIVE
 build_jellyfin() {
   info "Cloning jellyfin-packaging..."
@@ -223,19 +320,16 @@ build_jellyfin() {
   rm -rf "$BUILD_DIR/stage" && mkdir -p "$stage" "$BUILD_DIR/out/linux"
   sudo touch "$BUILD_LOG" && sudo chown "$USER" "$BUILD_LOG" && : > "$BUILD_LOG"
   info "Building Jellyfin from source (several minutes; full log: $BUILD_LOG)..."
-  export DOTNET_CLI_TELEMETRY_OPTOUT=1 DOTNET_NOLOGO=1
-  export NODE_OPTIONS="--max-old-space-size=2048"
 
   info "[1/3] dotnet publish jellyfin-server..."
-  (cd jellyfin-server && dotnet publish Jellyfin.Server --configuration Release \
-      --self-contained --runtime linux-x64 --output "$stage" \
-      -p:DebugSymbols=false -p:DebugType=none -p:UseAppHost=true) >>"$BUILD_LOG" 2>&1 \
-    || { tail -n 40 "$BUILD_LOG" >&2; die "dotnet publish (jellyfin-server) failed. See $BUILD_LOG"; }
+  run_step "dotnet publish (jellyfin-server)" bash -c "cd jellyfin-server && dotnet publish Jellyfin.Server --configuration Release \
+      --self-contained --runtime linux-x64 --output '$stage' -m:1 \
+      -p:UseSharedCompilation=false -p:DebugSymbols=false -p:DebugType=none -p:UseAppHost=true"
+  dotnet build-server shutdown >/dev/null 2>&1 || true
 
   info "[2/3] npm ci + build jellyfin-web..."
-  (cd jellyfin-web && npm ci --no-audit --unsafe-perm && npm run build:production \
-      && rm -rf "$stage/jellyfin-web" && mv dist "$stage/jellyfin-web") >>"$BUILD_LOG" 2>&1 \
-    || { tail -n 40 "$BUILD_LOG" >&2; die "jellyfin-web build failed. See $BUILD_LOG"; }
+  run_step "jellyfin-web build" bash -c "cd jellyfin-web && npm ci --no-audit --unsafe-perm && npm run build:production \
+      && rm -rf '$stage/jellyfin-web' && mv dist '$stage/jellyfin-web'"
 
   info "[3/3] Packing archive..."
   ARCHIVE="$BUILD_DIR/out/linux/jellyfin_${version}-amd64.tar.gz"
@@ -366,6 +460,7 @@ main() {
       echo "================================"
       detect_distro
       install_packages
+      check_memory
 
       echo
       prompt INSTALL_DIR "Install directory" "$DEFAULT_DIR"
