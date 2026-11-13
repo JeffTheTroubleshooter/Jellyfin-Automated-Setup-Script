@@ -5,6 +5,7 @@
 ## What it does
 
 - Detects your Linux distro and installs the build dependencies (.NET SDK, Node.js, ffmpeg); no Docker.
+- If the distro archive and the Microsoft apt repo do not carry the required .NET SDK (for example on Ubuntu 26.04), the installer falls back to Microsoft's official `dotnet-install.sh`.
 - Clones jellyfin-packaging and builds a portable Linux archive.
 - Installs Jellyfin (default `/opt/jellyfin`) and creates a `jellyfin` systemd service.
 

@@ -20,6 +20,14 @@ BUILD_DIR="/tmp/jellyfin-packaging"
 SERVICE_NAME="jellyfin"
 DEFAULT_PORT=8096
 
+# Used only when the .NET SDK is installed with Microsoft's dotnet-install.sh
+# (fallback when apt feeds have no package). Uninstall removes these files
+# only when the marker is present, so an apt-managed SDK is left alone.
+DOTNET_INSTALL_DIR="/usr/share/dotnet"
+DOTNET_SYMLINK="/usr/local/bin/dotnet"
+DOTNET_PROFILE_D="/etc/profile.d/dotnet.sh"
+DOTNET_INSTALL_MARKER="${DOTNET_INSTALL_DIR}/.jellyfin-dotnet-install-sh"
+
 # ── helpers (logs to stderr) ───────────────────────────────────────────────
 die() { echo -e "\n\033[1;31mError:\033[0m $*" >&2; exit 1; }
 info() { echo -e "\033[1;34m==>\033[0m $*" >&2; }
@@ -174,6 +182,136 @@ ensure_npm_engine() {
   ok "npm $cur (jellyfin-web needs >= $need)"
 }
 
+# Restore DOTNET_ROOT / PATH for this process when a previous run used
+# dotnet-install.sh, so later build steps and --list-sdks work in a
+# non-login shell that does not source /etc/profile.d.
+use_script_dotnet_env() {
+  export DOTNET_ROOT="$DOTNET_INSTALL_DIR"
+  case ":${PATH}:" in
+    *:"$DOTNET_ROOT":*) ;;
+    *) export PATH="${DOTNET_ROOT}:/usr/local/bin:${PATH}" ;;
+  esac
+}
+
+dotnet_marker_present() {
+  [[ -f "$DOTNET_INSTALL_MARKER" ]] || sudo test -f "$DOTNET_INSTALL_MARKER"
+}
+
+dotnet_sdk_ok() {
+  local ver="$1"
+  local sdks
+  if dotnet_marker_present; then
+    use_script_dotnet_env
+  fi
+  command -v dotnet >/dev/null 2>&1 || return 1
+  sdks=$(dotnet --list-sdks 2>/dev/null || true)
+  printf '%s\n' "$sdks" | grep -q "^${ver}\."
+}
+
+apt_has_dotnet_sdk() {
+  local ver="$1"
+  local cand
+  apt-cache show "dotnet-sdk-${ver}" >/dev/null 2>&1 || return 1
+  cand=$(apt-cache policy "dotnet-sdk-${ver}" 2>/dev/null | awk '/Candidate:/ {print $2; exit}')
+  [[ -n "$cand" && "$cand" != "(none)" ]]
+}
+
+# If the Microsoft apt path fails, drop packages-microsoft-prod and any
+# leftover source list so apt is not left with a broken repo.
+remove_microsoft_apt_repo() {
+  info "Removing Microsoft apt repo so it is not left as a broken source..."
+  sudo DEBIAN_FRONTEND=noninteractive apt-get purge -y packages-microsoft-prod >/dev/null 2>&1 || true
+  sudo rm -f /etc/apt/sources.list.d/microsoft-prod.list \
+    /etc/apt/sources.list.d/microsoft-prod.sources \
+    /etc/apt/sources.list.d/packages-microsoft-prod.list \
+    /etc/apt/sources.list.d/packages-microsoft-prod.sources
+  sudo apt-get update -qq || true
+}
+
+# Fallback chain: distro archive, then Microsoft apt repo (only if the
+# packages-microsoft-prod .deb download works), then official
+# dotnet-install.sh into /usr/share/dotnet. Die only if every path fails.
+install_dotnet_sdk() {
+  local ver="$1" msid="$2" msver="$3"
+  local deb=/tmp/packages-microsoft-prod.deb
+  local installer=/tmp/dotnet-install.sh
+  local ms_added=0
+
+  if dotnet_sdk_ok "$ver"; then
+    return 0
+  fi
+
+  info "Installing .NET SDK $ver (distro archive, then Microsoft repo, then dotnet-install.sh)..."
+  sudo apt-get update -qq || true
+  if apt_has_dotnet_sdk "$ver"; then
+    info "Installing .NET SDK $ver from the distro archive..."
+    if sudo DEBIAN_FRONTEND=noninteractive apt-get install -y "dotnet-sdk-${ver}"; then
+      if dotnet_sdk_ok "$ver"; then
+        return 0
+      fi
+      warn "dotnet-sdk-${ver} installed from the archive, but the $ver SDK was not listed."
+    else
+      warn "apt could not install dotnet-sdk-${ver} from the distro archive."
+    fi
+  else
+    info "dotnet-sdk-${ver} is not in the distro archive."
+  fi
+
+  info "Trying the Microsoft apt repo for .NET SDK $ver..."
+  if curl -fsSL "https://packages.microsoft.com/config/${msid}/${msver}/packages-microsoft-prod.deb" -o "$deb"; then
+    if sudo dpkg -i "$deb"; then
+      ms_added=1
+      if sudo apt-get update -qq \
+        && sudo DEBIAN_FRONTEND=noninteractive apt-get install -y "dotnet-sdk-${ver}"; then
+        rm -f "$deb"
+        if dotnet_sdk_ok "$ver"; then
+          return 0
+        fi
+        warn "Microsoft apt installed dotnet-sdk-${ver}, but the $ver SDK was not listed."
+      else
+        warn "Microsoft apt repo could not install dotnet-sdk-${ver}."
+      fi
+    else
+      warn "Could not install packages-microsoft-prod."
+    fi
+    rm -f "$deb"
+    if [[ "$ms_added" -eq 1 ]] || dpkg -s packages-microsoft-prod >/dev/null 2>&1; then
+      remove_microsoft_apt_repo
+    fi
+  else
+    warn "Could not download Microsoft repo config for ${msid} ${msver}."
+    rm -f "$deb"
+  fi
+
+  info "Falling back to Microsoft's dotnet-install.sh for .NET SDK $ver..."
+  if curl -fsSL "https://dot.net/v1/dotnet-install.sh" -o "$installer"; then
+    chmod +x "$installer"
+    if sudo bash "$installer" --channel "$ver" --install-dir "$DOTNET_INSTALL_DIR"; then
+      sudo ln -sfn "${DOTNET_INSTALL_DIR}/dotnet" "$DOTNET_SYMLINK"
+      printf '%s\n' "installed-by=jellyfin-install.sh" | sudo tee "$DOTNET_INSTALL_MARKER" >/dev/null
+      use_script_dotnet_env
+      sudo tee "$DOTNET_PROFILE_D" >/dev/null <<EOF
+export DOTNET_ROOT=$DOTNET_INSTALL_DIR
+export PATH="\$DOTNET_ROOT:\$PATH"
+EOF
+      sudo chmod 644 "$DOTNET_PROFILE_D"
+      hash -r
+      rm -f "$installer"
+      if dotnet_sdk_ok "$ver"; then
+        return 0
+      fi
+      warn "dotnet-install.sh finished, but the $ver SDK was not listed."
+    else
+      warn "dotnet-install.sh failed for channel $ver."
+      rm -f "$installer"
+    fi
+  else
+    warn "Could not download dotnet-install.sh."
+  fi
+
+  die "Could not install .NET SDK $ver from the distro archive, the Microsoft apt repo, or dotnet-install.sh."
+}
+
 install_toolchain() {
   local dotnet_ver="$1" node_ver="$2"
   [[ "$PKG" == "apt" ]] || die "Native Jellyfin build supports Debian/Ubuntu only (detected $ID). Install dotnet-sdk-$dotnet_ver and Node.js $node_ver manually, then rerun."
@@ -181,15 +319,7 @@ install_toolchain() {
   . /etc/os-release
   local msid="$ID" msver="$VERSION_ID"
   [[ "$msid" == "debian" ]] && msver="${VERSION_ID%%.*}"
-  if ! dotnet --list-sdks 2>/dev/null | grep -q "^${dotnet_ver}\."; then
-    info "Installing .NET SDK $dotnet_ver (packages.microsoft.com)..."
-    curl -fsSL "https://packages.microsoft.com/config/${msid}/${msver}/packages-microsoft-prod.deb" -o /tmp/packages-microsoft-prod.deb \
-      || die "Could not download Microsoft repo config for ${msid} ${msver}."
-    sudo dpkg -i /tmp/packages-microsoft-prod.deb
-    sudo apt-get update -qq
-    sudo DEBIAN_FRONTEND=noninteractive apt-get install -y "dotnet-sdk-${dotnet_ver}" \
-      || die "apt could not install dotnet-sdk-${dotnet_ver}."
-  fi
+  install_dotnet_sdk "$dotnet_ver" "$msid" "$msver"
   if [[ "$(node -v 2>/dev/null | sed 's/^v//; s/\..*//')" != "$node_ver" ]]; then
     info "Installing Node.js $node_ver (NodeSource)..."
     curl -fsSL "https://deb.nodesource.com/setup_${node_ver}.x" -o /tmp/nodesource-setup.sh \
@@ -425,6 +555,13 @@ remove_packages() {
       zypper) sudo zypper --non-interactive remove git python3 python3-GitPython python3-PyYAML python3-packaging || true ;;
       apk)    sudo apk del git python3 py3-gitpython py3-yaml py3-packaging || true ;;
     esac
+    # Only remove the script-installed SDK when our marker is present, so an
+    # apt-managed /usr/share/dotnet or /usr/local/bin/dotnet is left alone.
+    if dotnet_marker_present; then
+      info "Removing .NET SDK installed via dotnet-install.sh..."
+      sudo rm -f "$DOTNET_SYMLINK" "$DOTNET_PROFILE_D" "$DOTNET_INSTALL_MARKER"
+      sudo rm -rf "$DOTNET_INSTALL_DIR"
+    fi
     ok "Package removal finished."
   else
     info "Packages kept."
