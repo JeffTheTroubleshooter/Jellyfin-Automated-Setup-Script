@@ -6,8 +6,11 @@
 
 - Detects your Linux distro and installs the build dependencies (.NET SDK, Node.js, ffmpeg); no Docker.
 - If the distro archive and the Microsoft apt repo do not carry the required .NET SDK (for example on Ubuntu 26.04), the installer falls back to Microsoft's official `dotnet-install.sh`.
-- Clones jellyfin-packaging and builds a portable Linux archive.
-- Installs Jellyfin (default `/opt/jellyfin`) and creates a `jellyfin` systemd service.
+- Clones jellyfin-packaging and builds a portable Linux archive under `/var/tmp` (not `/tmp`, which is often a small tmpfs).
+- Checks that the install and build disks have at least 2 GB free before building.
+- Installs Jellyfin (default `/opt/jellyfin`) and creates a `jellyfin` systemd service with `TMPDIR=/opt/jellyfin/temp`, so startup does not crash when `/tmp` is too small.
+- After starting the service, waits up to 30 seconds for port 8096 to respond. If it does not, the script prints the last journal lines and exits with an error instead of printing "Done".
+- Rerunning the installer is safe: it stops an existing service, overwrites the files, rewrites the unit, and reloads systemd. Media data and cache are kept.
 
 ## Memory requirements and guard
 
@@ -55,7 +58,7 @@ sudo systemctl restart jellyfin
 bash jellyfin-install.sh uninstall
 ```
 
-This removes the service, the install files and the build folder, and asks before removing packages.
+This removes the service (including any systemd drop-ins), `/opt/jellyfin/temp`, the install files and the build folder, and asks before removing packages.
 
 ## Part of the Proxmox Homelab setup
 

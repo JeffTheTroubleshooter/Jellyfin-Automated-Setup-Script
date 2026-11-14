@@ -5,9 +5,13 @@
 # build step at once if it dies, is OOM-killed, or runs past STEP_TIMEOUT_SECS.
 # Detects distro, installs build deps (.NET SDK + Node.js), clones packaging repo,
 # builds a portable Linux archive natively (no Docker), installs it, and creates a systemd service.
+# Runtime temp lives under $INSTALL_DIR/temp (TMPDIR) so a small /tmp tmpfs cannot
+# crash the service (Jellyfin requires >= 2 GB free). The source build uses
+# /var/tmp, not /tmp. After start, the installer waits for port 8096 before "Done".
+# Rerunning is safe: the service is stopped, files/unit are overwritten, then reloaded.
 #
 # Usage:
-#   bash jellyfin-install.sh            # install
+#   bash jellyfin-install.sh            # install or reinstall/repair
 #   bash jellyfin-install.sh uninstall  # remove service, files, and optionally packages
 #
 
@@ -16,9 +20,14 @@ set -euo pipefail
 START_TIME=$(date +%s)
 REPO_URL="https://github.com/jellyfin/jellyfin-packaging.git"
 DEFAULT_DIR="/opt/jellyfin"
-BUILD_DIR="/tmp/jellyfin-packaging"
+# /tmp is often a small tmpfs (and Jellyfin itself refuses to start with < 2 GB
+# free under Path.GetTempPath, which follows TMPDIR). Build on disk instead.
+BUILD_DIR="/var/tmp/jellyfin-packaging"
+LEGACY_BUILD_DIR="/tmp/jellyfin-packaging"
 SERVICE_NAME="jellyfin"
 DEFAULT_PORT=8096
+MIN_FREE_MB=2048
+SERVICE_DROPIN_DIR="/etc/systemd/system/${SERVICE_NAME}.service.d"
 
 # Used only when the .NET SDK is installed with Microsoft's dotnet-install.sh
 # (fallback when apt feeds have no package). Uninstall removes these files
@@ -41,6 +50,77 @@ elapsed() {
   end=$(date +%s)
   local secs=$((end - START_TIME))
   printf '%dm %ds' $((secs/60)) $((secs%60))
+}
+
+# Free space in MB for path, or the closest existing parent.
+free_mb() {
+  local path="$1"
+  while [[ ! -e "$path" ]]; do
+    path=$(dirname "$path")
+    [[ "$path" == "." ]] && path="/"
+  done
+  df -Pm "$path" | awk 'NR==2 {print $4}'
+}
+
+# Jellyfin aborts if its temp dir has < 2 GB free. Check the install and build
+# filesystems before spending time on a source build.
+check_free_space() {
+  local install_mb build_mb
+  install_mb=$(free_mb "$INSTALL_DIR")
+  build_mb=$(free_mb "$BUILD_DIR")
+  info "Free space: ${install_mb} MB at $INSTALL_DIR, ${build_mb} MB at $BUILD_DIR (need >= ${MIN_FREE_MB} MB for data/cache/temp)."
+  if [[ -z "$install_mb" ]] || (( install_mb < MIN_FREE_MB )); then
+    die "Not enough free space for $INSTALL_DIR (data/cache/temp). Need at least ${MIN_FREE_MB} MB (2 GB), found ${install_mb:-unknown} MB.
+  Jellyfin requires >= 2 GB free for its temp folder. Free space or choose a larger disk, then rerun."
+  fi
+  if [[ -z "$build_mb" ]] || (( build_mb < MIN_FREE_MB )); then
+    die "Not enough free space for the build directory $BUILD_DIR. Need at least ${MIN_FREE_MB} MB, found ${build_mb:-unknown} MB.
+  The build is kept off /tmp because /tmp is often a small tmpfs. Free space and rerun."
+  fi
+}
+
+# Stop an existing service so a rerun can overwrite binaries and rewrite the unit.
+prepare_reinstall() {
+  if command -v systemctl >/dev/null 2>&1; then
+    if [[ -f "/etc/systemd/system/${SERVICE_NAME}.service" ]] || systemctl list-unit-files "${SERVICE_NAME}.service" --no-legend 2>/dev/null | grep -q .
+    then
+      info "Existing $SERVICE_NAME service found; stopping it for a safe reinstall/repair."
+      sudo systemctl stop "$SERVICE_NAME" 2>/dev/null || true
+    fi
+  fi
+  if [[ -x "$INSTALL_DIR/jellyfin" ]]; then
+    info "Existing install at $INSTALL_DIR will be overwritten (data/cache kept)."
+  fi
+}
+
+# After enable --now, wait until the unit is active and the web UI port answers.
+# On failure, print the last journal lines and exit nonzero (do not print "Done").
+verify_service() {
+  local waited=0 url="http://127.0.0.1:${DEFAULT_PORT}"
+  info "Waiting up to 30s for $SERVICE_NAME to become ready on port $DEFAULT_PORT..."
+  while (( waited < 30 )); do
+    if systemctl is-active --quiet "$SERVICE_NAME" && curl -s -o /dev/null --max-time 2 "$url"; then
+      ok "systemd service enabled and responding on port $DEFAULT_PORT."
+      return 0
+    fi
+    sleep 1
+    waited=$((waited + 1))
+  done
+  echo >&2
+  warn "$SERVICE_NAME did not become ready within 30s. Last 30 journal lines:"
+  sudo journalctl -u "$SERVICE_NAME" -n 30 --no-pager >&2 || true
+  die "$SERVICE_NAME failed to start or port $DEFAULT_PORT did not respond. Fix the error above and rerun."
+}
+
+cleanup_build_dir() {
+  if [[ -d "$BUILD_DIR" ]]; then
+    info "Cleaning build directory $BUILD_DIR..."
+    rm -rf "$BUILD_DIR"
+  fi
+  if [[ -d "$LEGACY_BUILD_DIR" ]]; then
+    info "Cleaning leftover build directory $LEGACY_BUILD_DIR..."
+    rm -rf "$LEGACY_BUILD_DIR"
+  fi
 }
 
 # ── distro detection ───────────────────────────────────────────────────────
@@ -482,10 +562,18 @@ install_files() {
 
 create_service() {
   local bin="$INSTALL_DIR/jellyfin"
+  local temp_dir="$INSTALL_DIR/temp"
   [[ -x "$bin" ]] || die "jellyfin binary not found at $bin"
+
+  # .NET Path.GetTempPath() follows TMPDIR. Keep it on the install disk so a
+  # small /tmp tmpfs cannot abort startup with "insufficient free space".
+  sudo mkdir -p "$temp_dir" "$INSTALL_DIR/data" "$INSTALL_DIR/cache"
+  sudo chown "$USER:$USER" "$temp_dir" "$INSTALL_DIR/data" "$INSTALL_DIR/cache"
 
   if command -v systemctl >/dev/null 2>&1; then
     info "Creating systemd service..."
+    # Drop leftover manual drop-ins so the unit is the single source of truth.
+    sudo rm -rf "$SERVICE_DROPIN_DIR"
     sudo tee "/etc/systemd/system/${SERVICE_NAME}.service" >/dev/null <<UNIT
 [Unit]
 Description=Jellyfin Media Server
@@ -495,6 +583,7 @@ After=network.target
 Type=simple
 User=$USER
 WorkingDirectory=$INSTALL_DIR
+Environment=TMPDIR=$temp_dir
 ExecStart=$bin --datadir $INSTALL_DIR/data --cachedir $INSTALL_DIR/cache --webdir $INSTALL_DIR/jellyfin-web
 Restart=always
 RestartSec=5
@@ -504,9 +593,9 @@ WantedBy=multi-user.target
 UNIT
     sudo systemctl daemon-reload
     sudo systemctl enable --now "$SERVICE_NAME"
-    ok "systemd service enabled and started."
+    verify_service
   else
-    warn "No systemd detected. Start manually with: $bin"
+    warn "No systemd detected. Start manually with: TMPDIR=$temp_dir $bin --datadir $INSTALL_DIR/data --cachedir $INSTALL_DIR/cache --webdir $INSTALL_DIR/jellyfin-web"
   fi
 }
 
@@ -517,8 +606,9 @@ remove_service() {
     sudo systemctl stop "$SERVICE_NAME" 2>/dev/null || true
     sudo systemctl disable "$SERVICE_NAME" 2>/dev/null || true
     sudo rm -f "/etc/systemd/system/${SERVICE_NAME}.service"
+    sudo rm -rf "$SERVICE_DROPIN_DIR"
     sudo systemctl daemon-reload
-    ok "systemd service removed."
+    ok "systemd service and drop-ins removed."
   fi
 }
 
@@ -536,12 +626,33 @@ remove_files() {
   fi
 }
 
+# Always drop the runtime temp dir, even when the rest of the install is kept.
+remove_temp_dir() {
+  local dir="${1:-$DEFAULT_DIR}"
+  if [[ -d "$dir/temp" ]]; then
+    sudo rm -rf "$dir/temp"
+    ok "Removed $dir/temp"
+  fi
+}
+
 remove_build_dir() {
+  local removed=0
   if [[ -d "$BUILD_DIR" ]]; then
     if ask_yn "Remove build directory $BUILD_DIR?"; then
       rm -rf "$BUILD_DIR"
       ok "Build directory removed."
+      removed=1
     fi
+  fi
+  if [[ -d "$LEGACY_BUILD_DIR" && "$LEGACY_BUILD_DIR" != "$BUILD_DIR" ]]; then
+    if ask_yn "Remove leftover build directory $LEGACY_BUILD_DIR?"; then
+      rm -rf "$LEGACY_BUILD_DIR"
+      ok "Leftover build directory removed."
+      removed=1
+    fi
+  fi
+  if [[ "$removed" -eq 0 && ! -d "$BUILD_DIR" && ! -d "$LEGACY_BUILD_DIR" ]]; then
+    info "No build directory found."
   fi
 }
 
@@ -576,6 +687,7 @@ uninstall() {
 
   echo
   prompt INSTALL_DIR "Install directory to remove" "$DEFAULT_DIR"
+  remove_temp_dir "$INSTALL_DIR"
   remove_files "$INSTALL_DIR"
   remove_build_dir
   remove_packages
@@ -601,11 +713,14 @@ main() {
 
       echo
       prompt INSTALL_DIR "Install directory" "$DEFAULT_DIR"
+      check_free_space
+      prepare_reinstall
 
       ARCHIVE=""
       build_jellyfin
       install_files "$ARCHIVE"
       create_service
+      cleanup_build_dir
 
       local ip
       ip=$(hostname -I 2>/dev/null | awk '{print $1}') || ip="localhost"
