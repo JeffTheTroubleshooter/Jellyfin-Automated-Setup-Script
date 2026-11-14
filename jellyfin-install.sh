@@ -9,10 +9,13 @@
 # crash the service (Jellyfin requires >= 2 GB free). The source build uses
 # /var/tmp, not /tmp. After start, the installer waits for port 8096 before "Done".
 # Rerunning is safe: the service is stopped, files/unit are overwritten, then reloaded.
+# After the service is up, you can create media library folders under /mnt (or skip).
 #
 # Usage:
 #   bash jellyfin-install.sh            # install or reinstall/repair
 #   bash jellyfin-install.sh uninstall  # remove service, files, and optionally packages
+#   bash jellyfin-install.sh folders    # only create /mnt media library folders
+#   bash jellyfin-install.sh --media-folders=all|none|movies,shows
 #
 
 set -euo pipefail
@@ -28,6 +31,20 @@ SERVICE_NAME="jellyfin"
 DEFAULT_PORT=8096
 MIN_FREE_MB=2048
 SERVICE_DROPIN_DIR="/etc/systemd/system/${SERVICE_NAME}.service.d"
+MEDIA_ROOT="/mnt"
+# num|keys|label|dirname  (Jellyfin library types; dirnames have no spaces)
+MEDIA_FOLDER_SPECS=(
+  "1|movies,movie|Movies|Movies"
+  "2|music|Music|Music"
+  "3|shows,show,tv,tv-shows,tvshows|Shows|Shows"
+  "4|books,book|Books|Books"
+  "5|home-videos-photos,home-videos,home-videos-and-photos,homevideos,photos|Home Videos and Photos|Home-Videos-Photos"
+  "6|music-videos,music-video,musicvideos|Music Videos|Music-Videos"
+  "7|mixed,mixed-movies-and-shows,mixed-movies-shows|Mixed Movies and Shows|Mixed"
+)
+MEDIA_FOLDERS_OPT=""
+MEDIA_SELECTED=()
+MEDIA_UNKNOWN=()
 
 # Used only when the .NET SDK is installed with Microsoft's dotnet-install.sh
 # (fallback when apt feeds have no package). Uninstall removes these files
@@ -599,6 +616,250 @@ UNIT
   fi
 }
 
+# ── media library folders under /mnt ───────────────────────────────────────
+media_spec_at() {
+  local want="$1" spec num keys label dirname
+  for spec in "${MEDIA_FOLDER_SPECS[@]}"; do
+    IFS='|' read -r num keys label dirname <<< "$spec"
+    if [[ "$num" == "$want" ]]; then
+      printf '%s' "$spec"
+      return 0
+    fi
+  done
+  return 1
+}
+
+# Match a token against a spec's number, keys, or dirname (case-insensitive).
+media_spec_for_token() {
+  local raw="$1" tok spec num keys label dirname key
+  tok="${raw,,}"
+  tok="${tok//_/-}"
+  tok="${tok// /}"
+  [[ -n "$tok" ]] || return 1
+  for spec in "${MEDIA_FOLDER_SPECS[@]}"; do
+    IFS='|' read -r num keys label dirname <<< "$spec"
+    if [[ "$tok" == "$num" || "$tok" == "${dirname,,}" ]]; then
+      printf '%s' "$spec"
+      return 0
+    fi
+    IFS=',' read -r -a keylist <<< "$keys"
+    for key in "${keylist[@]}"; do
+      if [[ "$tok" == "$key" ]]; then
+        printf '%s' "$spec"
+        return 0
+      fi
+    done
+  done
+  return 1
+}
+
+media_select_all() {
+  local spec num keys label dirname
+  MEDIA_SELECTED=()
+  for spec in "${MEDIA_FOLDER_SPECS[@]}"; do
+    IFS='|' read -r num keys label dirname <<< "$spec"
+    MEDIA_SELECTED+=("$label|$dirname")
+  done
+}
+
+# Add unique "label|dirname" entries from tokens (numbers, keys, or dirnames).
+# Unknown tokens go to MEDIA_UNKNOWN. Do not call this in a command substitution
+# (that would run in a subshell and lose MEDIA_SELECTED).
+media_select_from_tokens() {
+  local tok spec num keys label dirname entry
+  local -A seen=()
+  MEDIA_UNKNOWN=()
+  for tok in "$@"; do
+    [[ -n "$tok" ]] || continue
+    if spec=$(media_spec_for_token "$tok"); then
+      IFS='|' read -r num keys label dirname <<< "$spec"
+      entry="$label|$dirname"
+      if [[ -z "${seen[$entry]+x}" ]]; then
+        seen[$entry]=1
+        MEDIA_SELECTED+=("$entry")
+      fi
+    else
+      MEDIA_UNKNOWN+=("$tok")
+    fi
+  done
+  (( ${#MEDIA_UNKNOWN[@]} == 0 ))
+}
+
+media_valid_keys_csv() {
+  local spec num keys label dirname first
+  for spec in "${MEDIA_FOLDER_SPECS[@]}"; do
+    IFS='|' read -r num keys label dirname <<< "$spec"
+    first="${keys%%,*}"
+    printf '%s' "$first"
+    printf ','
+  done | sed 's/,$/\n/'
+}
+
+print_media_folder_menu() {
+  local spec num keys label dirname
+  echo "Media library folders" >&2
+  echo "Create folders under $MEDIA_ROOT for libraries you will add in Jellyfin." >&2
+  echo "You can skip this and add folders later." >&2
+  for spec in "${MEDIA_FOLDER_SPECS[@]}"; do
+    IFS='|' read -r num keys label dirname <<< "$spec"
+    printf '  %s) %-26s %s/%s\n' "$num" "$label" "$MEDIA_ROOT" "$dirname" >&2
+  done
+}
+
+# Fill MEDIA_SELECTED from --media-folders, a TTY prompt, or skip when no TTY.
+choose_media_folders() {
+  MEDIA_SELECTED=()
+  local opt="${MEDIA_FOLDERS_OPT-}" opt_lc tokens
+  if [[ -n "$opt" ]]; then
+    opt_lc="${opt,,}"
+    case "$opt_lc" in
+      all|a) media_select_all ; return 0 ;;
+      none|n|skip|s) return 0 ;;
+    esac
+    opt="${opt//,/ }"
+    # shellcheck disable=SC2206
+    tokens=($opt)
+    if ! media_select_from_tokens "${tokens[@]}"; then
+      die "Unknown media folder(s): ${MEDIA_UNKNOWN[*]}. Use: all, none, or a comma-separated list of: $(media_valid_keys_csv)"
+    fi
+    return 0
+  fi
+
+  if [[ ! -t 0 ]]; then
+    info "No TTY and --media-folders not set; skipping media folder creation."
+    return 0
+  fi
+
+  local ans toks
+  echo >&2
+  print_media_folder_menu
+  while true; do
+    MEDIA_SELECTED=()
+    read -rp "Select numbers (e.g. 1 3 5), 'a' for all, or Enter / 's' to skip: " ans
+    ans="${ans#"${ans%%[![:space:]]*}"}"
+    ans="${ans%"${ans##*[![:space:]]}"}"
+    if [[ -z "$ans" ]]; then
+      info "Skipping media folder creation."
+      return 0
+    fi
+    case "${ans,,}" in
+      a|all) media_select_all ; return 0 ;;
+      s|skip|n|none) info "Skipping media folder creation." ; return 0 ;;
+    esac
+    ans="${ans//,/ }"
+    # shellcheck disable=SC2206
+    toks=($ans)
+    if media_select_from_tokens "${toks[@]}"; then
+      return 0
+    fi
+    warn "Unknown choice(s): ${MEDIA_UNKNOWN[*]}. Pick 1-7, 'a' for all, or Enter / 's' to skip."
+  done
+}
+
+grant_invoking_user_access() {
+  local path="$1" service_user="$2" invoking_user="$3" invoking_group
+  [[ -n "$invoking_user" && "$invoking_user" != "$service_user" && "$invoking_user" != "root" ]] || return 0
+  id "$invoking_user" >/dev/null 2>&1 || return 0
+
+  if command -v setfacl >/dev/null 2>&1 && sudo setfacl -m "u:${invoking_user}:rwx" "$path" 2>/dev/null; then
+    sudo setfacl -d -m "u:${invoking_user}:rwx" "$path" 2>/dev/null || true
+    sudo setfacl -d -m "u:${service_user}:rwx" "$path" 2>/dev/null || true
+    return 0
+  fi
+
+  invoking_group=$(id -gn "$invoking_user" 2>/dev/null || true)
+  if [[ -n "$invoking_group" ]] && sudo chgrp "$invoking_group" "$path" && sudo chmod 775 "$path"; then
+    info "Granted group write on $path to $invoking_user (group $invoking_group)."
+    return 0
+  fi
+
+  warn "Could not grant $invoking_user write access to $path. Add the files as $service_user, or: sudo chmod 775 $path && sudo chown $service_user:$invoking_user $path"
+}
+
+# Create selected folders under $MEDIA_ROOT. Directory only (not recursive) so
+# existing media files keep their owners. Owner is the Jellyfin service user.
+create_media_folders() {
+  (( ${#MEDIA_SELECTED[@]} )) || return 0
+
+  local service_user service_group invoking_user entry label dirname path existed
+  service_user="${USER:-$(id -un)}"
+  service_group=$(id -gn "$service_user")
+  invoking_user="${SUDO_USER:-}"
+
+  sudo mkdir -p "$MEDIA_ROOT" || die "Could not create $MEDIA_ROOT."
+  info "Creating media folders under $MEDIA_ROOT (owner $service_user, mode 775)..."
+
+  for entry in "${MEDIA_SELECTED[@]}"; do
+    IFS='|' read -r label dirname <<< "$entry"
+    path="$MEDIA_ROOT/$dirname"
+    existed=0
+    [[ -d "$path" ]] && existed=1
+    sudo mkdir -p "$path" || die "Could not create $path."
+    sudo chown "$service_user:$service_group" "$path"
+    sudo chmod 775 "$path"
+    grant_invoking_user_access "$path" "$service_user" "$invoking_user"
+    if (( existed )); then
+      ok "Ready: $path  ($label, already existed; permissions updated)"
+    else
+      ok "Created: $path  ($label)"
+    fi
+  done
+}
+
+print_media_folder_summary() {
+  if (( ${#MEDIA_SELECTED[@]} == 0 )); then
+    echo "  Media folders: none created (you can add libraries later in Jellyfin,"
+    echo "    or run: bash $0 folders   /   bash $0 --media-folders=all)"
+    return 0
+  fi
+  local entry label dirname
+  echo "  Media folders (add each in Jellyfin: Dashboard > Libraries > Add Media Library)."
+  echo "  Use the matching content type, then point it at the folder:"
+  for entry in "${MEDIA_SELECTED[@]}"; do
+    IFS='|' read -r label dirname <<< "$entry"
+    printf '    %-26s %s/%s\n' "$label" "$MEDIA_ROOT" "$dirname"
+  done
+  echo "  Copy your files into those folders, then add the library in the Jellyfin UI."
+}
+
+# Uninstall never deletes /mnt library folders (they may hold media).
+mention_media_folders() {
+  local spec num keys label dirname path found=()
+  for spec in "${MEDIA_FOLDER_SPECS[@]}"; do
+    IFS='|' read -r num keys label dirname <<< "$spec"
+    path="$MEDIA_ROOT/$dirname"
+    [[ -d "$path" ]] && found+=("$path")
+  done
+  echo
+  if (( ${#found[@]} )); then
+    info "Left media folders in place under $MEDIA_ROOT (not deleted; they may hold your files):"
+    local p
+    for p in "${found[@]}"; do
+      echo "    $p"
+    done
+    echo "  Remove them yourself only if you no longer need the files."
+  else
+    info "No media folders found under $MEDIA_ROOT."
+  fi
+}
+
+media_folders_only() {
+  echo "Jellyfin media folders"
+  echo "======================"
+  # Flag already applied in main; only prompt when --media-folders was not given.
+  if [[ -z "$MEDIA_FOLDERS_OPT" ]]; then
+    choose_media_folders
+  fi
+  create_media_folders
+  echo
+  if (( ${#MEDIA_SELECTED[@]} )); then
+    ok "Media folders ready."
+  else
+    ok "No media folders created."
+  fi
+  print_media_folder_summary
+}
+
 # ── uninstall ──────────────────────────────────────────────────────────────
 remove_service() {
   info "Removing service..."
@@ -691,20 +952,70 @@ uninstall() {
   remove_files "$INSTALL_DIR"
   remove_build_dir
   remove_packages
+  mention_media_folders
 
   echo
   ok "Uninstall finished in $(elapsed)"
 }
 
-# ── main ───────────────────────────────────────────────────────────────────
-main() {
-  local mode="${1:-install}"
+# ── args / main ────────────────────────────────────────────────────────────
+usage() {
+  echo "Usage: $0 [install|uninstall|folders] [--media-folders=all|none|movies,shows]"
+}
 
-  case "$mode" in
-    uninstall|remove|--uninstall|-u)
+parse_args() {
+  MODE="install"
+  MEDIA_FOLDERS_OPT=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      uninstall|remove|--uninstall|-u)
+        MODE="uninstall"
+        shift
+        ;;
+      install)
+        MODE="install"
+        shift
+        ;;
+      folders|media-folders|--folders)
+        MODE="folders"
+        shift
+        ;;
+      --media-folders=*)
+        MEDIA_FOLDERS_OPT="${1#--media-folders=}"
+        shift
+        ;;
+      --media-folders)
+        [[ -n "${2-}" && "$2" != -* ]] || die "Option --media-folders requires a value (all, none, or a comma-separated list such as movies,shows)."
+        MEDIA_FOLDERS_OPT="$2"
+        shift 2
+        ;;
+      -h|--help)
+        usage
+        exit 0
+        ;;
+      *)
+        die "Unknown option: $1. $(usage)"
+        ;;
+    esac
+  done
+}
+
+main() {
+  parse_args "$@"
+
+  # Validate --media-folders early so a typo does not wait until after a long build.
+  if [[ "$MODE" != "uninstall" && -n "$MEDIA_FOLDERS_OPT" ]]; then
+    choose_media_folders
+  fi
+
+  case "$MODE" in
+    uninstall)
       uninstall
       ;;
-    install|"")
+    folders)
+      media_folders_only
+      ;;
+    install)
       echo "Jellyfin installer (from source)"
       echo "================================"
       detect_distro
@@ -721,6 +1032,10 @@ main() {
       install_files "$ARCHIVE"
       create_service
       cleanup_build_dir
+      if [[ -z "$MEDIA_FOLDERS_OPT" ]]; then
+        choose_media_folders
+      fi
+      create_media_folders
 
       local ip
       ip=$(hostname -I 2>/dev/null | awk '{print $1}') || ip="localhost"
@@ -730,6 +1045,7 @@ main() {
       echo
       echo "  Open:  http://${ip:-localhost}:$DEFAULT_PORT"
       echo "  Files: $INSTALL_DIR"
+      print_media_folder_summary
       echo
       echo "Service commands:"
       if command -v systemctl >/dev/null 2>&1; then
@@ -740,7 +1056,7 @@ main() {
       echo "To uninstall later: bash $0 uninstall"
       ;;
     *)
-      die "Unknown option: $mode. Use: $0 [install|uninstall]"
+      die "Unknown option: $MODE. $(usage)"
       ;;
   esac
 }

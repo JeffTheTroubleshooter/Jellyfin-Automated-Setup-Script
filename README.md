@@ -11,6 +11,7 @@
 - Installs Jellyfin (default `/opt/jellyfin`) and creates a `jellyfin` systemd service with `TMPDIR=/opt/jellyfin/temp`, so startup does not crash when `/tmp` is too small.
 - After starting the service, waits up to 30 seconds for port 8096 to respond. If it does not, the script prints the last journal lines and exits with an error instead of printing "Done".
 - Rerunning the installer is safe: it stops an existing service, overwrites the files, rewrites the unit, and reloads systemd. Media data and cache are kept.
+- After the service starts, offers to create media library folders under `/mnt` for Jellyfin's content types (Movies, Music, Shows, Books, Home Videos and Photos, Music Videos, Mixed Movies and Shows). You can pick several, choose all, or skip. Folders are owned by the Jellyfin service user, mode `775`, with access for the user who ran the script (`SUDO_USER`) so you can copy files in. Then add each folder in Jellyfin under **Dashboard > Libraries > Add Media Library**.
 
 ## Memory requirements and guard
 
@@ -43,7 +44,22 @@ If you try it on a distro marked "Not tested", please open an issue saying wheth
 bash jellyfin-install.sh
 ```
 
-Then open `http://<your-server-ip>:8096` to finish Jellyfin's setup wizard.
+After the service starts, the installer asks which media folders to create under `/mnt` (for example `/mnt/Movies`, `/mnt/Shows`). Type numbers such as `1 3 5`, `a` for all, or press Enter / `s` to skip. To skip the prompt:
+
+```bash
+bash jellyfin-install.sh --media-folders=all
+bash jellyfin-install.sh --media-folders=movies,shows
+bash jellyfin-install.sh --media-folders=none
+```
+
+If stdin is not a terminal and you did not pass `--media-folders`, folder creation is skipped. To create folders later without rebuilding Jellyfin:
+
+```bash
+bash jellyfin-install.sh folders
+bash jellyfin-install.sh folders --media-folders=all
+```
+
+Then open `http://<your-server-ip>:8096` to finish Jellyfin's setup wizard, and add each folder under **Dashboard > Libraries > Add Media Library** with the matching content type.
 
 Manage the service:
 
@@ -58,7 +74,7 @@ sudo systemctl restart jellyfin
 bash jellyfin-install.sh uninstall
 ```
 
-This removes the service (including any systemd drop-ins), `/opt/jellyfin/temp`, the install files and the build folder, and asks before removing packages.
+This removes the service (including any systemd drop-ins), `/opt/jellyfin/temp`, the install files and the build folder, and asks before removing packages. It does **not** delete media folders under `/mnt` (they may hold your files); the uninstaller only lists them if they exist.
 
 ## Part of the Proxmox Homelab setup
 
